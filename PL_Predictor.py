@@ -1,77 +1,61 @@
 ## Erik Cupsa 
 ## PL Predictor using scikit-learn to predict from the matches.csv stat sheet containing data from all matches from 2022-2020
+## improved by Time-Amanu, improved things> controlled data leakage, increased efficiency and speed by removing redundent code
 
-import pandas as pd 
-matches = pd.read_csv("matches.csv", index_col = 0)
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, precision_score
 
-##converting all objects to int or float to be processed by the machine learning software
+# 1. Load and Clean Data
+matches = pd.read_csv("matches.csv", index_col=0)
+
+# Convert date and time info
 matches["date"] = pd.to_datetime(matches["date"])
-matches["h/a"] = matches["venue"].astype("category").cat.codes ## converting venue to a home (1) or away (0) number
-matches["opp"] = matches["opponent"].astype("category").cat.codes ## converting opponents to a number
-matches["hour"] = matches["time"].str.replace(":.+", "", regex=True).astype("int") ## converting hours to number in case a team plays better at a certain time
-matches["day"] = matches["date"].dt.dayofweek ## converting day of week of game to a number
+matches["venue_code"] = matches["venue"].astype("category").cat.codes
+matches["opp_code"] = matches["opponent"].astype("category").cat.codes
+matches["hour"] = matches["time"].str.replace(":.+", "", regex=True).astype("int")
+matches["day_code"] = matches["date"].dt.dayofweek
+matches["target"] = (matches["result"] == "W").astype("int")
 
-matches["target"] = (matches["result"] == "W").astype("int") ## setting a win to the value 1
+# 2. Setup Initial Model
+rf = RandomForestClassifier(n_estimators=100, min_samples_split=10, random_state=1)
 
-from sklearn.ensemble import RandomForestClassifier ##importing machine learning for non linear data
-
-rf = RandomForestClassifier(n_estimators = 100, min_samples_split=10, random_state=1)
-train = matches[matches["date"] < '2022-01-01'] 
-test = matches[matches["date"] > '2022-01-01']
-predictors = ["h/a", "opp", "hour", "day"]
-rf.fit(train[predictors], train["target"])
-RandomForestClassifier(min_samples_split = 10, n_estimators = 100, random_state = 1)
-preds = rf.predict(test[predictors]) ##making prediction
-
-from sklearn.metrics import accuracy_score
-acc = accuracy_score(test["target"], preds) ## testing accuracy
-acc
-combined = pd.DataFrame(dict(actual=test["target"], prediction=preds))
-pd.crosstab(index=combined["actual"], columns=combined["prediction"])
-
-from sklearn.metrics import precision_score
-precision_score(test["target"], preds)
-
-grouped_matches = matches.groupby("team") 
-group = grouped_matches.get_group("Manchester United").sort_values("date")
- 
-def rolling_averages(group, cols, new_cols): ## function to take into consideration form of a team
-    group = group.sort_values("date") ## sorting games by date 
+# 3. Define Rolling Averages Function
+def rolling_averages(group, cols, new_cols):
+    group = group.sort_values("date")
+    # closed='left' prevents the model from "seeing" the current game's stats
     rolling_stats = group[cols].rolling(3, closed='left').mean()
     group[new_cols] = rolling_stats
-    group = group.dropna(subset=new_cols) ##droping missing values and replacing with empty
-    return group 
+    return group.dropna(subset=new_cols)
 
-cols = ["gf", "ga", "sh", "sot", "dist", "fk", "pk", "pkatt"] 
-new_cols = [f"{c}_rolling" for c in cols] ## creating new columns with rolling average values 
+# Features to calculate rolling averages for
+cols = ["gf", "ga", "sh", "sot", "dist", "fk", "pk", "pkatt"]
+new_cols = [f"{c}_rolling" for c in cols]
 
-rolling_averages(group, cols, new_cols) ## calling function and generating average of last 3 games
+# Apply rolling averages per team
+matches_rolling = matches.groupby("team", group_keys=False).apply(lambda x: rolling_averages(x, cols, new_cols))
+matches_rolling.index = range(matches_rolling.shape[0])
 
-matches_rolling = matches.groupby("team").apply(lambda x: rolling_averages(x, cols, new_cols))
-matches_rolling = matches_rolling.droplevel('team') ## dropping extra index level
-
-matches_rolling.index = range(matches_rolling.shape[0]) ## adding new index
-matches_rolling
-def make_predictions(data, predictors): ## making the predictions
-    train = data[data["date"] < '2022-01-01'] 
+# 4. Prediction Logic
+def make_predictions(data, predictors):
+    train = data[data["date"] < '2022-01-01']
     test = data[data["date"] > '2022-01-01']
+    
     rf.fit(train[predictors], train["target"])
-    preds = rf.predict(test[predictors]) ##making prediction
+    preds = rf.predict(test[predictors])
+    
     combined = pd.DataFrame(dict(actual=test["target"], prediction=preds), index=test.index)
     precision = precision_score(test["target"], preds)
-    return combined, precision ## returning the values for the prediction
+    return combined, precision
 
-combined, precision = make_predictions(matches_rolling, predictors + new_cols)
+# Define predictors (Base features + Rolling stats)
+predictors = ["venue_code", "opp_code", "hour", "day_code"] + new_cols
 
-precision
+combined, precision = make_predictions(matches_rolling, predictors)
 
-combined 
-
-combined = combined.merge(matches_rolling[["date", "team", "opponent", "result"]], left_index = True, right_index = True)
-combined
-
-class MissingDict(dict): ## creating a class that inherits from the dictionary class
-    __missing__ = lambda self, key: key ## in case a team name is missing
+# 5. Team Name Mapping for Merging
+class MissingDict(dict):
+    __missing__ = lambda self, key: key
 
 map_values = {
     "Brighton and Hove Albion": "Brighton",
@@ -81,13 +65,26 @@ map_values = {
     "Wolverhampton Wanderers": "Wolves"
 }
 mapping = MissingDict(**map_values)
-mapping["West Ham United"]
 
+combined["team"] = matches_rolling["team"]
+combined["date"] = matches_rolling["date"]
+combined["opponent"] = matches_rolling["opponent"]
 combined["new_team"] = combined["team"].map(mapping)
-combined
 
-merged = combined.merge(combined, left_on=["date", "new_team"], right_on=["date", "opponent"]) ## finding both the home and away team predictions and merging them 
-merged
+# 6. Merge Home and Away Predictions
+# This allows us to see what the AI predicted for both Team A and Team B in the same match
+merged = combined.merge(
+    combined, 
+    left_on=["date", "new_team"], 
+    right_on=["date", "opponent"], 
+    suffixes=("_team", "_opp")
+)
 
+# 7. Final Output Analysis
+print(f"Precision Score: {precision:.2f}")
 
-## project inspired by dataquest tutorial 
+# Show cases where the model was confident (Predicted a win for one and a loss for the other)
+logic_check = merged[(merged["prediction_team"] == 1) & (merged["prediction_opp"] == 0)]
+actual_win_rate = (logic_check["actual_team"] == 1).mean()
+
+print(f"Accuracy when predicting a specific winner: {actual_win_rate:.2f}")
